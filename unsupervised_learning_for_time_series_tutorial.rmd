@@ -1,0 +1,1284 @@
+---
+title: "Unsupervised Learning using time-series"
+author: "Ozan Aygun"
+date: "6/22/2021"
+output: 
+  html_document:
+    code_folding: show                  
+    depth: 6
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: True
+      smooth_scroll: True
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(results = "markup", fig.align = "center",
+                      fig.height= 8, fig.width= 8,message=FALSE,warning=FALSE)
+```
+
+
+```{r library loading}
+require(dplyr)
+require(pheatmap)
+require(reshape2)
+require(IncDTW)
+require(dtwclust)
+require(RColorBrewer)
+require(caret)
+require(lubridate)
+```
+
+
+
+# Data
+
+For this tutorial I will use a multivariate time-series data set comprising 1000 yearly PubMed counts of drug Ingredients between 1950 - 2020:
+
+```{r prepare data}
+set.seed(15651)
+count_table <- read.csv("../OB_analytics/output/pubmed_count_table_ob.csv", stringsAsFactors = FALSE)
+
+# Randomly choose 1000 unique ingredient names and retrieve corresponding series
+ing_selected <- sample(unique(count_table$ing_name),1000,replace = FALSE) 
+
+count_table <- count_table %>%
+    filter(ing_name %in% ing_selected) %>%
+    filter(Year %in% 1950:2020) %>%
+    select(Year,ing_name,contains("count")) 
+
+count_table %>% 
+    head(10)
+```
+
+The data is organized in long format. Each unique ingredient is linked to 4 count variables that represent the observed PubMed publication counts for each of the ingredients. Total counts represent total Pubmed counts, other series are subsets of this series, using clinical trial types as filters. Hence, the data set is considered as "multivariate time-series" even though the dimensions are clearly dependent on another.
+
+
+# Unsupervised learning using univariate time-series
+
+
+For the purpose of univariate experiments, let's focus on the least sparse time-series for each ingredient:
+
+- pubmed_query_total_counts
+
+
+```{r select univariate series}
+counts_uni <- count_table %>% 
+    select(Year,ing_name,counts = pubmed_query_total_counts) %>%
+    dcast(Year ~ ing_name, value.var = "counts") %>%
+    select(-Year)
+
+row.names(counts_uni) <- 1950:2020
+colnames(counts_uni) <- make.names(colnames(counts_uni))
+
+head(counts_uni,10)
+```
+
+Hence, we transformed the univariate time-series of each drug ingredient across years 1950-2020 and represented as a matrix.
+
+- Columns represent individual time-series vectors corresponding to each drug ingredient
+- Rows represent Years (i.e: time axis)
+
+
+Let's look at the resulting data matrix:
+
+```{r, fig.align='center', fig.width=20, fig.height= 8}
+# Remove all-zero counts if any
+mask <- apply(counts_uni,2,sum) != 0
+counts_uni <- counts_uni[,mask]
+
+# Min-max scale the counts
+counts_uni_scaled <- apply(counts_uni,2,function(x){
+    
+    return( (x - min(x)) / (max(x) - min(x)) ) 
+    
+    }) %>% data.frame()
+
+pheatmap(counts_uni_scaled, 
+         cluster_rows = F, 
+         cluster_cols = F,  
+         fontsize_col = 1, 
+         fontsize_row = 8,cellheight = 7,
+         color = colorRampPalette(brewer.pal(n = 7, name ="Oranges"))(1000))
+```
+
+
+For many drug ingredients, there are higher counts/signal as we approach to late 2010s.
+
+
+## Hiearchical clustering using DTW similarity
+
+
+IncDTW package provides a streamlined way (written using C++) to calculate pairwise DTW similarities ('distances'), and leverages parallel computing. 
+
+Two functions are particularly noteworthy to mention here:
+
+- dtw_dismat : calculates pairwise DTW distances across a given list of series (`lot` argument)
+- dtw_disvec: calculates a vector of DTW distances for a list of series (`lot` argument) all relative to one query time series (`Q` argument)
+
+
+Here, I will utilize dtw_dismat to conveniently generate a pairwise similarity matrix using the sample data, then use hierarchical clustering to visualize similarities between the time series:
+
+
+```{r Hiearchical clustering using DTW similarity,fig.width=15, fig.height= 15}
+
+distmatrix <- dtw_dismat(lot = c(counts_uni_scaled), # convert scaled univariate time-series to a list
+                         dist_method = "norm2", # using 2-norm as the base-distance for DTW
+                         step_pattern = "symmetric2",
+                         normalize = FALSE, # Returns normalized pairwise distances if TRUE, important when series are in different lengths, here we have all series in the same length
+                         ws = NULL, # describes the window size for the sakoe chiba window, in this case we don't set. 
+                         threshold = NULL, # In this case we don't use early abandoning, but can be performed using this parameter
+                         ncores = 7, # NUmber of cores to be used in parallel computing (uses parallel package by default)
+                         return_matrix = TRUE # Returns a symmetric pairwise distance matrix
+                         )
+
+# Use log of the distances to examine clusters
+log_dist_matrix <- log1p(distmatrix$dismat)
+pheatmap(log_dist_matrix, 
+         cluster_rows = T, 
+         cluster_cols = T,
+         fontsize_row = 0.1,
+         fontsize_col = 0.1,
+         clustering_method = "complete",
+         cutree_rows = 4,
+         cutree_cols = 4,
+         fontsize = 12)
+```
+
+
+
+Overall we notice at least 2 distinct clusters that are pushed towards the opposing sides. In general, we see more dissimilarity (higher pairwise dtw values) across the series.
+
+
+### Extracting clusters using a dendogram height cut
+
+
+First extract some of these clusters:
+
+
+```{r visualize similar series based on DTW, fig.width=15, fig.height= 5}
+distmatrix <- dtw_dismat(lot = c(counts_uni_scaled), # convert scaled univariate time-series to a list
+                         dist_method = "norm2_square", # using 2-norm squared as the base-distance for DTW
+                         step_pattern = "symmetric2",
+                         normalize = FALSE, # Returns normalized pairwise distances if TRUE, important when series are in different lengths, here we have all series in the same length
+                         ws = NULL, # describes the window size for the sakoe chiba window, in this case we don't set. 
+                         threshold = NULL, # In this case we don't use early abandoning, but can be performed using this parameter
+                         ncores = 7, # NUmber of cores to be used in parallel computing (uses parallel package by default)
+                         return_matrix = FALSE # Returns a dissimilarity object
+                         )
+
+# Use log of the distances to examine clusters
+log_dist_matrix <- log1p(distmatrix$dismat)
+
+clusters <- hclust(log_dist_matrix, method = "complete")
+
+cut_height <- sort(clusters$height, decreasing = TRUE)[15] # We will mark the cut point for the highest level 15 clusters
+
+plot(clusters,labels = F, col = "navy")
+abline(h = cut_height, col = "red", lty = 2)
+```
+
+
+Next, we focus on the 15 clusters that are highest in the hierarchy by cutting the dendrogram and obtain cluster memberships of each series:
+
+
+```{r}
+cluster_membership <- cutree(clusters, h = cut_height)
+
+cluster_membership[1:5]
+
+unique(cluster_membership)
+```
+As we can notice, we selected the top 15 clusters (since we sorted dendrogram heights before cutting the tree), the resulting named vector represents cluster membership, which we can use to plot series across groups.  
+
+At the same time, we will use `dba()` to calculate Barycenters (centroids or average series obtained using DTW) for a given cluster and plot in conjunction.
+
+Let's plot for Cluster 1:
+
+
+```{r plot cluster 1, fig.align='center', fig.width=15, fig.height= 5}
+# Timeline of the plots (i.e: x-axis)
+timeline <- as.numeric(row.names(counts_uni_scaled))
+
+i = 1 # cluster index
+
+# identify the columns that represent the series in the given cluster
+columns_selected <- colnames(counts_uni_scaled) %in% names(cluster_membership[cluster_membership == i]) 
+
+# List of series in the given cluster
+series_in_cluster <- c(counts_uni_scaled[,columns_selected])
+
+# Calculate Barycenter Centroid for the given cluster
+bc <- IncDTW::dba(lot = series_in_cluster,
+                  dist_method = "norm2",
+                  step_pattern = "symmetric2" 
+                  )$m1 # m1 is the series that correspond to Barycenter
+
+# plot each series in the cluster
+plot(x = timeline, y = rep(1.1, length(timeline)), type = "n", ylab = "signal", ylim = c(0,1.1),
+     main = paste0("Cluster ",i))
+for (s in 1:length(series_in_cluster)){
+    lines(x = timeline, y = series_in_cluster[[s]], col = scales::alpha("grey",0.5))
+}
+# Add Barycenter
+lines(x = timeline, y = bc, col = "red", lwd = 2)
+```
+
+### Plotting selected time-series clusters along with their respective barycenter
+
+
+Let's plot all 15 clusters as a 5 x 3 plot:
+
+
+
+```{r plot clusters, fig.align='center', fig.width= 24, fig.height= 15}
+# Timeline of the plots (i.e: x-axis)
+timeline <- as.numeric(row.names(counts_uni_scaled))
+
+par(mfrow = c(5,3))
+
+for ( i in 1:length(unique(cluster_membership))){
+    # identify the columns that represent the series in the given cluster
+    columns_selected <- colnames(counts_uni_scaled) %in% names(cluster_membership[cluster_membership == i]) 
+    
+    # List of series in the given cluster
+    series_in_cluster <- c(counts_uni_scaled[,columns_selected])
+    
+    # Calculate Barycenter Centroid for the given cluster
+    bc <- IncDTW::dba(lot = series_in_cluster,
+                      dist_method = "norm2",
+                      step_pattern = "symmetric2" 
+                      )$m1 # m1 is the series that correspond to Barycenter
+    
+    # plot each series in the cluster
+    plot(x = timeline, y = rep(1.1, length(timeline)), type = "n", ylab = "signal", ylim = c(0,1.1),
+         main = paste0("Cluster ",i))
+    for (s in 1:length(series_in_cluster)){
+        lines(x = timeline, y = series_in_cluster[[s]], col = scales::alpha("grey",0.5))
+    }
+    # Add Barycenter
+    lines(x = timeline, y = bc, col = "red", lwd = 2)
+}    
+```
+
+
+This visualization illustrates a few remarkable points:
+
+1. As expected from the earlier heatmap, some clusters are formed by dissimilar series hence more noisy. Due to the nature of the hierarchical clustering algorithm, these series ae likely to be pushed into clusters that are mainly driven my noise, while there could be remarkable similarities particularly towards the end of the series.
+2. Many cluster centroids are flat zero before 1980, presumably due to the sparsity (enriched zero counts) of many series before 1980.
+
+
+### Focusing on recent, less sparse data to improve pattern extraction
+
+
+Hence, let's focus on the data beyond 1980 to see the impact on clusters:
+
+
+```{r plot clusters data beyond 1980, fig.align='center', fig.width= 30, fig.height= 18}
+
+set.seed(5465)
+
+counts_uni <- count_table %>% 
+    select(Year,ing_name,counts = pubmed_query_clinical_trial_counts) %>%
+    dcast(Year ~ ing_name, value.var = "counts") %>%
+    select(-Year)
+
+row.names(counts_uni) <- 1950:2020
+colnames(counts_uni) <- make.names(colnames(counts_uni))
+
+# Remove all-zero counts if any
+mask <- apply(counts_uni,2,sum) != 0
+counts_uni <- counts_uni[,mask]
+
+# Min-max scale the counts
+counts_uni_scaled <- apply(counts_uni,2,function(x){
+    
+    return( (x - min(x)) / (max(x) - min(x)) ) 
+    
+    }) %>% data.frame()
+
+
+mask <- as.numeric(row.names(counts_uni_scaled)) >= 1980 # Focusing on data observed 1980 and beyond
+
+distmatrix <- dtw_dismat(lot = c(counts_uni_scaled[mask,]), # convert scaled univariate time-series to a list
+                         dist_method = "norm2_square", # using 2-norm squared as the base-distance for DTW
+                         step_pattern = "symmetric2",
+                         normalize = FALSE, # Returns normalized pairwise distances if TRUE, important when series are in different lengths, here we have all series in the same length
+                         ws = NULL, # describes the window size for the sakoe chiba window, in this case we don't set. 
+                         threshold = NULL, # In this case we don't use early abandoning, but can be performed using this parameter
+                         ncores = 7, # NUmber of cores to be used in parallel computing (uses parallel package by default)
+                         return_matrix = FALSE # Returns a dissimilarity object
+                         )
+
+# Use log of the distances to examine clusters
+log_dist_matrix <- log1p(distmatrix$dismat)
+
+clusters <- hclust(log_dist_matrix, method = "complete")
+cut_height <- sort(clusters$height, decreasing = TRUE)[15] # We will mark the cut point for the highest level 15 clusters
+cluster_membership <- cutree(clusters, h = cut_height)
+
+
+# Timeline of the plots (i.e: x-axis)
+timeline <- as.numeric(row.names(counts_uni_scaled[mask,]))
+
+cluster_series_with_bc = list() # A spare list to hold series in each cluster along with barycenters
+
+par(mfrow = c(5,3))
+
+for ( i in 1:length(unique(cluster_membership))){
+    # identify the columns that represent the series in the given cluster
+    columns_selected <- colnames(counts_uni_scaled) %in% names(cluster_membership[cluster_membership == i]) 
+    
+    # List of series in the given cluster
+    series_in_cluster <- c(counts_uni_scaled[mask,columns_selected])
+    
+    # Calculate Barycenter Centroid for the given cluster
+    bc <- IncDTW::dba(lot = series_in_cluster,
+                      dist_method = "norm2",
+                      step_pattern = "symmetric2" 
+                      )$m1 # m1 is the series that correspond to Barycenter
+    
+    # plot each series in the cluster
+    plot(x = timeline, y = rep(1.1, length(timeline)), type = "n", ylab = "signal", ylim = c(0,1.1),
+         main = paste0("Cluster ",i))
+    for (s in 1:length(series_in_cluster)){
+        lines(x = timeline, y = series_in_cluster[[s]], col = scales::alpha("grey",0.5))
+    }
+    # Add Barycenter
+    lines(x = timeline, y = bc, col = "red", lwd = 2)
+    
+    series_in_cluster <- list(series_in_cluster,bc = bc[,1])
+    
+    cluster_series_with_bc[[i]] <- series_in_cluster
+    
+}
+
+
+```
+
+In fact, restricting data beyond 1980 seems to form clusters that are tighter around the centroids (particularly see clusters 5,13,14, and 15), while we still see many noisy clusters.
+
+
+### Visualization of original series heatmap ordered based on clusters
+
+
+Next, let's visualize the original series (scaled) that are ordered to these 15 clusters in a heatmap:
+
+
+```{r, fig.height= 10, fig.width= 25}
+
+# For each series in a given cluster, calculate their distance to their respective barycenter, 
+# order based on this distance
+# Select series from counts_uni_scaled in the selected order, then cbind
+series_distance_to_bc <- list()
+series_matrix <- list()
+
+for (i in 1:length(cluster_series_with_bc)){
+    temp <- cluster_series_with_bc[[i]]
+    query <- temp$bc
+    lot <- within(temp,rm(bc))[[1]]
+    distvector <- dtw_disvec(Q = query, lot = lot, 
+                         dist_method = "norm2_square", # using 2-norm squared as the base-distance for DTW
+                         step_pattern = "symmetric2",
+                         normalize = FALSE, # Returns normalized pairwise distances if TRUE, important when series are in different lengths, here we have all series in the same length
+                         ws = NULL, # describes the window size for the sakoe chiba window, in this case we don't set. 
+                         threshold = NULL, # In this case we don't use early abandoning, but can be performed using this parameter
+                         ncores = 7 # NUmber of cores to be used in parallel computing (uses parallel package by default)
+                         )$disvec 
+
+    distvector <- distvector[order(distvector)]
+    
+    series_distance_to_bc[[i]] <- distvector
+    
+    series_matrix[[i]] <- counts_uni_scaled[names(distvector)]
+    
+} 
+
+names(series_distance_to_bc) <- paste0("cluster_",1:length(cluster_series_with_bc))
+
+# Prepare the ordered series matrix based on clusters
+series_matrix <- do.call(cbind,series_matrix)
+mask <- as.numeric(row.names(counts_uni_scaled)) >= 1980 # Focusing on data observed 1980 and beyond
+series_matrix <- series_matrix[mask,]
+
+
+# Only label rows once in 5 years to avoid clutter in the plot
+mask <- as.numeric(row.names(series_matrix)) %% 5 != 0
+labels_row <- ifelse(mask,"",row.names(series_matrix))
+
+######################################################
+# Add annotations for drugs to identify clusters
+Cluster = NULL
+Ing.names = NULL
+for (k in 1:length(series_distance_to_bc)){
+    
+    Cluster <- c(Cluster,rep(names(series_distance_to_bc)[k], length(series_distance_to_bc[[k]])))
+    Ing.names <- c(Ing.names,names(series_distance_to_bc[[k]]))
+}
+
+annotation_col = data.frame(
+    Cluster = Cluster
+)
+row.names(annotation_col) <- Ing.names
+x <- c(brewer.pal(n = 12, name ="Paired"),brewer.pal(n = 3, name ="Dark2"))
+names(x) <-  names(series_distance_to_bc)      
+annt_colors <- list(Cluster = x)
+######################################################
+
+
+pheatmap(series_matrix, 
+         cluster_rows = F, 
+         cluster_cols = F,  
+         fontsize_col = 1, annotation_colors = annt_colors, labels_row = labels_row,
+         fontsize_row = 8,cellheight = 7, annotation_col =  annotation_col,
+         color = colorRampPalette(brewer.pal(n = 7, name ="Oranges"))(1000))
+```
+
+
+I note the patterns are more structured across many clusters, while I still observe many noisy clusters without a clear pattern. This is particularly the case for sparse time-series. Hence, next question becomes whether we can get a better clustering if we filter series with "little or no variance".
+
+
+### Testing the impact of a "Near-zero variance" filter on clusters
+
+
+```{r plot clusters data beyond 1980 with nzv filter, fig.align='center', fig.width= 30, fig.height= 18}
+
+set.seed(5465)
+
+counts_uni <- count_table %>% 
+    select(Year,ing_name,counts = pubmed_query_clinical_trial_counts) %>%
+    dcast(Year ~ ing_name, value.var = "counts") %>%
+    select(-Year)
+
+row.names(counts_uni) <- 1950:2020
+colnames(counts_uni) <- make.names(colnames(counts_uni))
+
+# Remove all-zero counts if any
+mask <- apply(counts_uni,2,sum) != 0
+counts_uni <- counts_uni[,mask]
+
+mask <- as.numeric(row.names(counts_uni)) >= 1980 # Focusing on data observed 1980 and beyond
+counts_uni <- counts_uni[mask,]
+
+###############################
+# Near zero variance filter 
+###############################
+mask <- nearZeroVar(counts_uni)
+counts_uni <- counts_uni[,-mask]
+
+
+# Min-max scale the counts
+counts_uni_scaled <- apply(counts_uni,2,function(x){
+    
+    return( (x - min(x)) / (max(x) - min(x)) ) 
+    
+    }) %>% data.frame()
+
+
+
+distmatrix <- dtw_dismat(lot = c(counts_uni_scaled), # convert scaled univariate time-series to a list
+                         dist_method = "norm2_square", # using 2-norm squared as the base-distance for DTW
+                         step_pattern = "symmetric2",
+                         normalize = FALSE, # Returns normalized pairwise distances if TRUE, important when series are in different lengths, here we have all series in the same length
+                         ws = NULL, # describes the window size for the sakoe chiba window, in this case we don't set. 
+                         threshold = NULL, # In this case we don't use early abandoning, but can be performed using this parameter
+                         ncores = 7, # NUmber of cores to be used in parallel computing (uses parallel package by default)
+                         return_matrix = FALSE # Returns a dissimilarity object
+                         )
+
+# Use log of the distances to examine clusters
+log_dist_matrix <- log1p(distmatrix$dismat)
+
+clusters <- hclust(log_dist_matrix, method = "complete")
+cut_height <- sort(clusters$height, decreasing = TRUE)[15] # We will mark the cut point for the highest level 15 clusters
+cluster_membership <- cutree(clusters, h = cut_height)
+
+
+# Timeline of the plots (i.e: x-axis)
+timeline <- as.numeric(row.names(counts_uni_scaled))
+
+cluster_series_with_bc = list() # A spare list to hold series in each cluster along with barycenters
+
+par(mfrow = c(5,3))
+
+for ( i in 1:length(unique(cluster_membership))){
+    # identify the columns that represent the series in the given cluster
+    columns_selected <- colnames(counts_uni_scaled) %in% names(cluster_membership[cluster_membership == i]) 
+    
+    # List of series in the given cluster
+    series_in_cluster <- c(counts_uni_scaled[,columns_selected])
+    
+    # Calculate Barycenter Centroid for the given cluster
+    bc <- IncDTW::dba(lot = series_in_cluster,
+                      dist_method = "norm2",
+                      step_pattern = "symmetric2" 
+                      )$m1 # m1 is the series that correspond to Barycenter
+    
+    # plot each series in the cluster
+    plot(x = timeline, y = rep(1.1, length(timeline)), type = "n", ylab = "signal", ylim = c(0,1.1),
+         main = paste0("Cluster ",i))
+    for (s in 1:length(series_in_cluster)){
+        lines(x = timeline, y = series_in_cluster[[s]], col = scales::alpha("grey",0.5))
+    }
+    # Add Barycenter
+    lines(x = timeline, y = bc, col = "red", lwd = 2)
+    
+    series_in_cluster <- list(series_in_cluster,bc = bc[,1])
+    
+    cluster_series_with_bc[[i]] <- series_in_cluster
+    
+}
+
+
+```
+
+Finally, let's also visualize the original series (scaled) that are ordered to these 15 clusters in a heatmap:
+
+
+```{r, fig.height= 10, fig.width=25}
+
+# For each series in a given cluster, calculate their distance to their respective barycenter, 
+# order based on this distance
+# Select series from counts_uni_scaled in the selected order, then cbind
+series_distance_to_bc <- list()
+series_matrix <- list()
+
+for (i in 1:length(cluster_series_with_bc)){
+    temp <- cluster_series_with_bc[[i]]
+    query <- temp$bc
+    lot <- within(temp,rm(bc))[[1]]
+    distvector <- dtw_disvec(Q = query, lot = lot, 
+                         dist_method = "norm2_square", # using 2-norm squared as the base-distance for DTW
+                         step_pattern = "symmetric2",
+                         normalize = FALSE, # Returns normalized pairwise distances if TRUE, important when series are in different lengths, here we have all series in the same length
+                         ws = NULL, # describes the window size for the sakoe chiba window, in this case we don't set. 
+                         threshold = NULL, # In this case we don't use early abandoning, but can be performed using this parameter
+                         ncores = 7 # NUmber of cores to be used in parallel computing (uses parallel package by default)
+                         )$disvec 
+
+    distvector <- distvector[order(distvector)]
+    
+    series_distance_to_bc[[i]] <- distvector
+    
+    series_matrix[[i]] <- counts_uni_scaled[names(distvector)]
+    
+} 
+
+names(series_distance_to_bc) <- paste0("cluster_",1:length(cluster_series_with_bc))
+
+# Prepare the ordered series matrix based on clusters
+series_matrix <- do.call(cbind,series_matrix)
+mask <- as.numeric(row.names(counts_uni_scaled)) >= 1980 # Focusing on data observed 1980 and beyond
+series_matrix <- series_matrix[mask,]
+
+
+# Only label rows once in 5 years to avoid clutter in the plot
+mask <- as.numeric(row.names(series_matrix)) %% 5 != 0
+labels_row <- ifelse(mask,"",row.names(series_matrix))
+
+######################################################
+# Add annotations for drugs to identify clusters
+Cluster = NULL
+Ing.names = NULL
+for (k in 1:length(series_distance_to_bc)){
+    
+    Cluster <- c(Cluster,rep(names(series_distance_to_bc)[k], length(series_distance_to_bc[[k]])))
+    Ing.names <- c(Ing.names,names(series_distance_to_bc[[k]]))
+}
+
+annotation_col = data.frame(
+    Cluster = Cluster
+)
+row.names(annotation_col) <- Ing.names
+x <- c(brewer.pal(n = 12, name ="Paired"),brewer.pal(n = 3, name ="Dark2"))
+names(x) <-  names(series_distance_to_bc)      
+annt_colors <- list(Cluster = x)
+######################################################
+
+
+pheatmap(series_matrix, 
+         cluster_rows = F, 
+         cluster_cols = F,  
+         fontsize_col = 1, annotation_colors = annt_colors, labels_row = labels_row,
+         fontsize_row = 8,cellheight = 7, annotation_col =  annotation_col,
+         color = colorRampPalette(brewer.pal(n = 7, name ="Oranges"))(1000))
+```
+
+
+Perhaps some of the clusters look further consolidated, still there are several fuzzy clusters visible. 
+
+
+### Testing enrichment of Orange Book "drug facts" across clusters
+
+
+As a next step for hierarchical clustering experiment, let's check if any of the clusters may be enriched with any facts about these drug ingredients. Let's go back to Orange Book and extract some summary metrics at ingredient level and try to see if anything stands out at cluster-level.
+
+
+
+```{r extract summary information from OB, fig.width=18, fig.height= 8}
+
+ob_table <- readRDS("./input/ob_table.rds")
+
+ob_table_summary <- ob_table %>%
+    select(Ingredient,Appl_Type,Appl_No,Type) %>%
+    distinct() %>%
+    mutate(
+        Appl_Type_N = ifelse(Appl_Type == "N",1,0),
+        Appl_Type_A = ifelse(Appl_Type == "A",1,0),
+        Type_DISCN = ifelse(Type == "DISCN",1,0),
+        Type_OTC = ifelse(Type == "OTC",1,0),
+        Type_RX = ifelse(Type == "RX",1,0)
+
+    ) %>%
+    select(-Appl_Type, -Type) %>%
+    group_by(Ingredient) %>% # aggregate sums over Ingredients
+    summarise(
+        num_unique_applications = length(unique(Appl_No)),
+        total_Appl_Type_N = sum(Appl_Type_N),
+        total_Appl_Type_A = sum(Appl_Type_A),
+        total_Type_DISCN = sum(Type_DISCN),
+        total_Type_OTC = sum(Type_OTC),
+        total_Type_RX = sum(Type_RX),
+    ) %>% 
+    mutate(Ingredient = make.names(Ingredient)) %>%
+    filter(Ingredient %in% names(cluster_membership)) %>%
+    mutate(cluster_membership = as.factor(cluster_membership[Ingredient])) %>%
+    select(-Ingredient) %>%
+    data.frame() %>% 
+    melt(id.var = "cluster_membership")
+
+ggplot(ob_table_summary, aes(x = cluster_membership, y = value))+
+    geom_boxplot(fill = "navy")+
+    facet_wrap(. ~ variable, scales = "free")+
+    xlab("Cluster Membership")
+
+```
+
+
+The results don't imply a particular cluster that stands out with respect to these summary metrics at the ingredient level. Note that clusters 13,14 and 15 appear slightly higher, but this could be also due to the fact that these are relatively small clusters. 
+
+Interestingly, cluster 4 seem to have ingredients that have slightly higher unique applications (on average), and this cluster seems to reflect PubMed time-series profiles that were high in early 1980, and gradually getting lower.  
+
+
+### Exploring and visualizing drug approval signal along with cluster barycenters
+
+
+Next, let's investigate how the time-series profile of application approval counts for a given cluster reflects relative to the barycenter.
+
+- Get all unique application approval counts for a given ingredient, for a given year between 1980 - 2020
+- Aggregate over cluster membership and given year:
+    - total_approvals per year
+  
+
+- Plot and visualize along with series in the respective clusters and their barycenters     
+
+
+
+
+
+```{r plot clusters data and application summaries beyond 1980 with nzv filter, fig.align='center', fig.width= 30, fig.height= 18}
+
+set.seed(5465)
+
+counts_uni <- count_table %>% 
+    select(Year,ing_name,counts = pubmed_query_clinical_trial_counts) %>%
+    dcast(Year ~ ing_name, value.var = "counts") %>%
+    select(-Year)
+
+row.names(counts_uni) <- 1950:2020
+colnames(counts_uni) <- make.names(colnames(counts_uni))
+
+# Remove all-zero counts if any
+mask <- apply(counts_uni,2,sum) != 0
+counts_uni <- counts_uni[,mask]
+
+mask <- as.numeric(row.names(counts_uni)) >= 1980 # Focusing on data observed 1980 and beyond
+counts_uni <- counts_uni[mask,]
+
+###############################
+# Near zero variance filter 
+###############################
+mask <- nearZeroVar(counts_uni)
+counts_uni <- counts_uni[,-mask]
+
+
+# Min-max scale the counts
+counts_uni_scaled <- apply(counts_uni,2,function(x){
+    
+    return( (x - min(x)) / (max(x) - min(x)) ) 
+    
+    }) %>% data.frame()
+
+
+
+distmatrix <- dtw_dismat(lot = c(counts_uni_scaled), # convert scaled univariate time-series to a list
+                         dist_method = "norm2_square", # using 2-norm squared as the base-distance for DTW
+                         step_pattern = "symmetric2",
+                         normalize = FALSE, # Returns normalized pairwise distances if TRUE, important when series are in different lengths, here we have all series in the same length
+                         ws = NULL, # describes the window size for the sakoe chiba window, in this case we don't set. 
+                         threshold = NULL, # In this case we don't use early abandoning, but can be performed using this parameter
+                         ncores = 7, # NUmber of cores to be used in parallel computing (uses parallel package by default)
+                         return_matrix = FALSE # Returns a dissimilarity object
+                         )
+
+# Use log of the distances to examine clusters
+log_dist_matrix <- log1p(distmatrix$dismat)
+
+clusters <- hclust(log_dist_matrix, method = "complete")
+cut_height <- sort(clusters$height, decreasing = TRUE)[15] # We will mark the cut point for the highest level 15 clusters
+cluster_membership <- cutree(clusters, h = cut_height)
+
+
+# Timeline of the plots (i.e: x-axis)
+timeline <- as.numeric(row.names(counts_uni_scaled))
+
+cluster_series_with_bc = list() # A spare list to hold series in each cluster along with barycenters
+
+
+########################################################
+# Prepare Application summary metric time-series from OB
+########################################################
+
+ob_table <- readRDS("./input/ob_table.rds")
+
+ob_table_summary <- ob_table %>%
+    select(Ingredient,Appl_Type,Appl_No,Approval_Date) %>%
+    distinct() %>% 
+    filter(Approval_Date != 'Approved Prior to Jan 1, 1982') %>%
+    mutate(Approval_Date = mdy(Approval_Date)) %>%
+    mutate(approval_year = year(Approval_Date)) %>% 
+    mutate(Ingredient = make.names(Ingredient)) %>%
+    filter(Ingredient %in% names(cluster_membership)) %>%
+    mutate(cluster_membership = as.numeric(cluster_membership[Ingredient])) %>%
+    group_by(cluster_membership,approval_year) %>%
+    summarise(total_num_approvals = n())
+
+approval_table <- expand.grid(approval_year = 1980:2020,
+                             cluster_membership = 1:15,stringsAsFactors = FALSE) %>%
+    left_join(ob_table_summary)%>%
+    mutate(total_num_approvals = ifelse(is.na(total_num_approvals),0,total_num_approvals)) %>%
+    dcast(approval_year ~ cluster_membership)
+
+row.names(approval_table) <- approval_table$approval_year
+
+approval_table <- approval_table %>% select(-approval_year)
+
+approval_table <- apply(approval_table,2, function(x){
+    
+    return( (x - min(x)) / (max(x) - min(x)) ) 
+    
+    })
+
+par(mfrow = c(5,3))
+
+for ( i in 1:length(unique(cluster_membership))){
+    # identify the columns that represent the series in the given cluster
+    columns_selected <- colnames(counts_uni_scaled) %in% names(cluster_membership[cluster_membership == i]) 
+    
+    # List of series in the given cluster
+    series_in_cluster <- c(counts_uni_scaled[,columns_selected])
+    
+    # Calculate Barycenter Centroid for the given cluster
+    bc <- IncDTW::dba(lot = series_in_cluster,
+                      dist_method = "norm2",
+                      step_pattern = "symmetric2" 
+                      )$m1 # m1 is the series that correspond to Barycenter
+    
+    # plot each series in the cluster
+    plot(x = timeline, y = rep(1.1, length(timeline)), type = "n", ylab = "signal", ylim = c(0,1.1),
+         main = paste0("Cluster ",i))
+    for (s in 1:length(series_in_cluster)){
+        lines(x = timeline, y = series_in_cluster[[s]], col = scales::alpha("grey",0.5))
+    }
+    # Add Barycenter
+    lines(x = timeline, y = bc, col = "red", lwd = 2)
+    
+    series_in_cluster <- list(series_in_cluster,bc = bc[,1])
+    
+    cluster_series_with_bc[[i]] <- series_in_cluster
+    
+    # Add total approvals per year
+    lines(x = timeline, y = approval_table[,i], col = "navy", lwd = 2)
+    
+    legend("topleft", legend = c("Approvals","Cluster barycenter"), lwd = 2,
+           col = c("navy","red"))
+    
+}
+
+
+```
+
+
+
+
+This observation is particularly interesting, because we can notice that the total approvals signal over-time closely follow the barycenter of the respective clusters in several cases. This would imply that the underlying structure we unveiled by clustering clinical trial related publication counts may correlate with total FDA approvals for the ingredients within that cluster. For certain clusters (for instance cluster 1 and 9) the barycenter appears to be slightly lagging the approvals signal, which may signify potential predictive/forecasting power of certain clusters. These observations are worth for further investigating.
+
+
+## K-shape clustering of time-series
+
+
+In this section, I will employ K-shape algorithm described in:
+
+
+"Paparrizos J and Gravano L (2015). “k-Shape: Efficient and Accurate Clustering of Time Series.” In
+Proceedings of the 2015 ACM SIGMOD International Conference on Management of Data, series
+SIGMOD ’15, pp. 1855-1870. ISBN 978-1-4503-2758-9, http://www1.cs.columbia.edu/~jopa/Papers/PaparrizosSIGMOD2015.pdf .
+2737793."
+
+I will use the API of the `dtwclust` package in R, which provides a nice gateway for various time-series clustering algorithms, including the K-shape.
+
+
+First, let's prepare the time-series data as before:
+
+
+
+```{r prepare data again}
+set.seed(15651)
+count_table <- read.csv("../OB_analytics/output/pubmed_count_table_ob.csv", stringsAsFactors = FALSE)
+
+# Randomly choose 1000 unique ingredient names and retrieve corresponding series
+ing_selected <- sample(unique(count_table$ing_name),1000,replace = FALSE) 
+
+count_table <- count_table %>%
+    filter(ing_name %in% ing_selected) %>%
+    filter(Year %in% 1980:2020) %>%
+    select(Year,ing_name,contains("count")) 
+
+counts_uni <- count_table %>% 
+    select(Year,ing_name,counts = pubmed_query_clinical_trial_counts) %>%
+    dcast(Year ~ ing_name, value.var = "counts") %>%
+    select(-Year)
+
+row.names(counts_uni) <- 1980:2020
+colnames(counts_uni) <- make.names(colnames(counts_uni))
+
+###############################
+# Near zero variance filter 
+###############################
+
+mask <- nearZeroVar(counts_uni)
+counts_uni <- counts_uni[,-mask]
+
+head(counts_uni,10)
+
+```
+
+
+`tsclust` is the main gateway function in the `dtwclust` package. Basically, setting the following arguments provide an implementation of the k-shape algorithm:
+
+
+- `type` = "partitional", `preproc` = zscore, `distance` = "sbd" and `centroid` = "shape"
+
+
+Note that in this case I don't scale the time-series, as k-shape algorithm uses z-scores as the preprocessing function
+
+
+```{r  k-shape clustering}
+
+lot <- c(counts_uni) # Prepare list of time-series corresponding to each sample
+
+clustering <- tsclust(series = lot,
+                      type = "partitional", # Type of clustering method to use
+                      k = 10, # Number of clusters
+                      preproc = "zscore", # preprocessing function to use
+                      distance = "sbd", # distance metric to use 
+                      centroid = "shape", # function to calculate centroids
+                      seed = 48615 # For reproducibility
+                      )
+
+```
+
+
+The resulting object is a S4 class of: `TSClusters`, containing a lot of metadata along with clustering information.
+
+
+Let's look at some of these components to further understand the resulting object:
+
+
+- `@cluster`: Integer vector indicating which cluster a series belongs to (crisp partition)
+
+
+Hence, this vector stores the resulting cluster membership for each of the series use in model training:
+
+
+```{r}
+clustering@cluster[1:20]
+length(clustering@cluster)
+length(lot)
+```
+
+- `@centroids`: A list with the centroid time series
+
+Similar to barycenter centroids, time-series corresponding to centroids of the k-shape clustering. Note that the centroid series are provided as z-scores as k-shape algorithm works at the z-score space.
+
+
+```{r}
+clustering@centroids[[1]]
+# Centroids for k=10 clusters
+length(clustering@centroids)
+```
+
+- `@clusinfo`: A data frame with two columns: size indicates the number of series each cluster has, and av_dist indicates, for each cluster, the average distance between series and their respective centroids (crisp partition).
+
+
+This could be a useful output to explore optimal number of clusters when training the model.
+
+
+```{r}
+print(clustering@clusinfo)
+```
+
+
+- `@cldist`: A column vector with the distance between each series in the data and its corresponding centroid (crisp partition).
+
+
+This could be another useful output to explore optimal number of clusters when training the model, when used along with the cluster membership metadata (i.e: `@cluster`)
+
+
+```{r}
+head(clustering@cldist)
+nrow(clustering@cldist)
+```
+
+
+### Visualize k-shape clustering 
+
+
+Let's visualize k-shape clustering results along with the resulting centroids.
+
+
+```{r, fig.width=20, fig.height=18}
+cluster_membership <- clustering@cluster
+
+
+# Timeline of the plots (i.e: x-axis)
+timeline <- as.numeric(row.names(counts_uni))
+
+cluster_series_with_centroids = list() # A spare list to hold series in each cluster along with centroids
+series_zscored <- data.frame(clustering@datalist) # z-scored series used for clustering
+
+
+par(mfrow = c(5,2))
+
+for ( i in 1:length(unique(cluster_membership))){
+    # identify the columns that represent the series in the given cluster
+    columns_selected <- colnames(series_zscored)[cluster_membership == i]  
+    
+    # List of series in the given cluster
+    temp <- series_zscored[,columns_selected]
+    series_in_cluster <- c(temp)
+    
+    # Get the Centroid for the given cluster
+    cent <-  clustering@centroids[[i]]
+    
+    # plot each series in the cluster
+    plot(x = timeline, y = rep(1.1, length(timeline)), type = "n", ylab = "signal", ylim = c(min(temp),max(temp)),
+         main = paste0("Cluster ",i))
+    for (s in 1:length(series_in_cluster)){
+        lines(x = timeline, y = series_in_cluster[[s]], col = scales::alpha("grey",0.5))
+    }
+    # Add Centroid
+    lines(x = timeline, y = cent, col = "red", lwd = 2)
+    
+    series_in_cluster <- list(series_in_cluster,centroid = cent)
+    
+    cluster_series_with_centroids[[i]] <- series_in_cluster
+    
+}
+
+```
+
+Using k-shape clustering, it seems like we are getting generally tighter clusters compared to clusters we obtained by using hierarchical clustering. Next, let's try to optimize the k, number of clusters, to see which k we could choose for the given data set.
+
+
+### Choosing optimal k for the k-shape clustering
+
+
+Choosing the number of clusters is ultimately a trade off between overfitting to the training set and having very few, hence underfitting model. If we choose too many clusters we can get very tight clusters but the resulting model may not be generalizeable and would be harder to explain due to large number of clusters. On the other hand, if we choose too few clusters, then clusters would have more heterogeneity, hence they would be more noisy, less likely to contain a special pattern.
+
+In order to facilitate selection of k (number of clusters), I will follow two metrics observed for a given clustering attempt:
+
+- Total distance between series and centroids of the cluster they belong to, averaged across all clusters
+- Average distance between series and centroids of the cluster they belong to, averaged across all clusters
+
+I will also monitor the time it takes to train the model as another dimension for the comparison.
+
+
+```{r}
+
+# NUmber of clusters that will be tested in the experiment
+K.values = c(2:15,18,20,22,25,30,40,50)
+
+results <- data.frame(K.values = K.values,
+                      total_distance = 0,
+                      average_distance = 0 ,
+                      compute_time = 0,
+                      stringsAsFactors = FALSE)
+
+
+# Test for each K.value
+for (i in 1:length(K.values)){
+  
+  K <- K.values[i]
+  
+  # Clustering model
+  clustering <- tsclust(series = lot,
+                      type = "partitional", # Type of clustering method to use
+                      k = K, # Number of clusters
+                      preproc = "zscore", # preprocessing function to use
+                      distance = "sbd", # distance metric to use 
+                      centroid = "shape", # function to calculate centroids
+                      seed = 48615 # For reproducibility
+                      )
+  
+  average_distance <- mean(clustering@clusinfo$av_dist)
+  total_distance <- data.frame(distance = clustering@cldist[,1],
+                               cluster = clustering@cluster) %>%
+    group_by(cluster)%>%
+    summarize(total = sum(distance))  
+  total_distance <- mean(total_distance$total)
+  compute_time <- clustering@proctime[1]
+  
+  results$total_distance[i] <- total_distance
+  results$average_distance[i] <- average_distance
+  results$compute_time[i] <- compute_time
+  
+}
+
+```
+
+
+
+Next, lets visualize all these 3 dimensions we collected about the experiment:
+
+
+```{r plot k selection, fig.width=12, fig.height=6}
+
+results_summary <- melt(results, id.vars = "K.values")
+
+ggplot(results_summary, aes(x = K.values , y = value))+
+  geom_line(color = "navy")+
+  geom_point(color= "navy")+
+  facet_grid(variable ~ ., scales = "free")
+
+```
+
+
+It looks like for the given data set k = 15 is a good trade-off. Both total and average distance decreases fairly steadily up to this point, and increasing model complexity beyond k = 15 gives only marginal reduction with respect to these metrics. At the same time computing time is relatively similar in the range of k = 12 to k = 30. 
+
+
+### Traing K-shape model using the selected number of clusters
+
+
+Let's retrain the model with the selected number of clusters and visualize the resulting clusters:
+
+
+
+
+```{r  k-shape clustering using optimal k, fig.width=20, fig.height=15 }
+
+lot <- c(counts_uni) # Prepare list of time-series corresponding to each sample
+
+clustering <- tsclust(series = lot,
+                      type = "partitional", # Type of clustering method to use
+                      k = 15, # Number of clusters
+                      preproc = "zscore", # preprocessing function to use
+                      distance = "sbd", # distance metric to use 
+                      centroid = "shape", # function to calculate centroids
+                      seed = 48615 # For reproducibility
+                      )
+
+cluster_membership <- clustering@cluster
+
+
+# Timeline of the plots (i.e: x-axis)
+timeline <- as.numeric(row.names(counts_uni))
+
+cluster_series_with_centroids = list() # A spare list to hold series in each cluster along with centroids
+series_zscored <- data.frame(clustering@datalist) # z-scored series used for clustering
+
+
+par(mfrow = c(5,3))
+
+for ( i in 1:length(unique(cluster_membership))){
+    # identify the columns that represent the series in the given cluster
+    columns_selected <- colnames(series_zscored)[cluster_membership == i]  
+    
+    # List of series in the given cluster
+    temp <- series_zscored[,columns_selected]
+    series_in_cluster <- c(temp)
+    
+    # Get the Centroid for the given cluster
+    cent <-  clustering@centroids[[i]]
+    
+    # plot each series in the cluster
+    plot(x = timeline, y = rep(1.1, length(timeline)), type = "n", ylab = "signal", ylim = c(min(temp),max(temp)),
+         main = paste0("Cluster ",i))
+    for (s in 1:length(series_in_cluster)){
+        lines(x = timeline, y = series_in_cluster[[s]], col = scales::alpha("grey",0.5))
+    }
+    # Add Centroid
+    lines(x = timeline, y = cent, col = "red", lwd = 2)
+    
+    series_in_cluster <- list(series_in_cluster,centroid = cent)
+    
+    cluster_series_with_centroids[[i]] <- series_in_cluster
+    
+}
+```
+
+
+Many of the clusters we obtained look remarkably tighter relative to the hierarchical clustering.
+
+
+### Heatmap visualization of the z-scored series after clustering 
+
+Let's also visualize the original series (scaled) that are ordered to these 15 clusters in a heatmap:
+
+
+```{r, fig.height= 10, fig.width=25}
+
+# For each series in a given cluster, use their distance to their respective centroid, 
+# order based on this distance
+# Select series from series_zcored in the selected order, then cbind
+series_matrix <- list()
+series_distance_to_bc <- list()
+
+
+for (i in 1:length(unique(cluster_membership))){
+    temp <- series_zscored[cluster_membership == i]
+   
+    distvector <- clustering@cldist[,1][cluster_membership == i]
+    names(distvector) <- colnames(temp)
+    distvector <- distvector[order(distvector)]
+    series_distance_to_bc[[i]] <- distvector
+    
+    series_matrix[[i]] <- temp[names(distvector)]
+    
+} 
+
+names(series_distance_to_bc) <- paste0("cluster_",1:length(unique(cluster_membership)))
+
+# Prepare the ordered series matrix based on clusters
+series_matrix <- do.call(cbind,series_matrix)
+
+
+# Only label rows once in 5 years to avoid clutter in the plot
+mask <- as.numeric(row.names(counts_uni)) %% 5 != 0
+labels_row <- ifelse(mask,"",row.names(counts_uni))
+
+######################################################
+# Add annotations for drugs to identify clusters
+Cluster = NULL
+Ing.names = NULL
+for (k in 1:length(series_distance_to_bc)){
+    
+    Cluster <- c(Cluster,rep(names(series_distance_to_bc)[k], length(series_distance_to_bc[[k]])))
+    Ing.names <- c(Ing.names,names(series_distance_to_bc[[k]]))
+}
+
+annotation_col = data.frame(
+    Cluster = Cluster
+)
+row.names(annotation_col) <- Ing.names
+x <- c(brewer.pal(n = 12, name ="Paired"),brewer.pal(n = 3, name ="Dark2"))
+names(x) <-  names(series_distance_to_bc)      
+annt_colors <- list(Cluster = x)
+######################################################
+
+
+pheatmap(series_matrix, 
+         cluster_rows = F, 
+         cluster_cols = F,  
+         fontsize_col = 1, annotation_colors = annt_colors, labels_row = labels_row,
+         fontsize_row = 8,cellheight = 7, annotation_col =  annotation_col,
+         color = colorRampPalette(rev(brewer.pal(n = 10, name ="RdBu")))(100))
+```
+
+
+### Visualize drug approval signal along with k-shape clusters
+
+
+Just like we explored for the hieararchical clustering, let's also explore how the drug approval signal aligns with the clusters we have:
+
+
+```{r,fig.width=20, fig.height=15 }
+########################################################
+# Prepare Application summary metric time-series from OB
+########################################################
+names(cluster_membership) <- colnames(series_zscored)
+
+ob_table <- readRDS("./input/ob_table.rds")
+
+ob_table_summary <- ob_table %>%
+    select(Ingredient,Appl_Type,Appl_No,Approval_Date) %>%
+    distinct() %>% 
+    filter(Approval_Date != 'Approved Prior to Jan 1, 1982') %>%
+    mutate(Approval_Date = mdy(Approval_Date)) %>%
+    mutate(approval_year = year(Approval_Date)) %>% 
+    mutate(Ingredient = make.names(Ingredient)) %>%
+    filter(Ingredient %in% names(cluster_membership)) %>%
+    mutate(cluster_membership = as.numeric(cluster_membership[Ingredient])) %>%
+    group_by(cluster_membership,approval_year) %>%
+    summarise(total_num_approvals = n())
+
+approval_table <- expand.grid(approval_year = 1980:2020,
+                             cluster_membership = 1:15,stringsAsFactors = FALSE) %>%
+    left_join(ob_table_summary)%>%
+    mutate(total_num_approvals = ifelse(is.na(total_num_approvals),0,total_num_approvals)) %>%
+    dcast(approval_year ~ cluster_membership)
+
+row.names(approval_table) <- approval_table$approval_year
+
+approval_table <- approval_table %>% select(-approval_year)
+
+# Convert approval signal to z-scores
+approval_table <- apply(approval_table,2, function(x){
+    
+    return( (x - mean(x)) / sd(x)) 
+    
+    })
+
+
+par(mfrow = c(5,3))
+
+for ( i in 1:length(unique(cluster_membership))){
+    # identify the columns that represent the series in the given cluster
+    columns_selected <- colnames(series_zscored)[cluster_membership == i]  
+    
+    # List of series in the given cluster
+    temp <- series_zscored[,columns_selected]
+    series_in_cluster <- c(temp)
+    
+    # Get the Centroid for the given cluster
+    cent <-  clustering@centroids[[i]]
+    
+    # plot each series in the cluster
+    plot(x = timeline, y = rep(1.1, length(timeline)), type = "n", ylab = "signal", ylim = c(min(temp),max(temp)),
+         main = paste0("Cluster ",i))
+    for (s in 1:length(series_in_cluster)){
+        lines(x = timeline, y = series_in_cluster[[s]], col = scales::alpha("grey",0.5))
+    }
+    # Add Centroid
+    lines(x = timeline, y = cent, col = "red", lwd = 2)
+    
+    series_in_cluster <- list(series_in_cluster,centroid = cent)
+    
+    cluster_series_with_centroids[[i]] <- series_in_cluster
+    
+     # Add total approvals per year
+    lines(x = timeline, y = approval_table[,i], col = "navy", lwd = 2)
+    
+    legend("topleft", legend = c("Approvals","Cluster centroid"), lwd = 2,
+           col = c("navy","red"))
+    
+}
+
+```
+
+
+Again, I notice some degree of overlap, perhaps a lagged pattern, between select cluster centroids and total approval signal for the drug ingredients within a given cluster.  
